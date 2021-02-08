@@ -5,6 +5,7 @@ from torch.optim import Adam
 
 import torchvision
 from torchvision.utils import save_image
+from torchvision import io
 
 import os
 import sys
@@ -148,6 +149,7 @@ class BigSleep(nn.Module):
         max_classes = None,
         class_temperature = 2.,
         experimental_resample = False,
+        target_img = "target.png"
     ):
         super().__init__()
         self.loss_coef = loss_coef
@@ -163,57 +165,73 @@ class BigSleep(nn.Module):
             class_temperature = class_temperature
         )
 
+        self.target_img = target_img
+
     def reset(self):
         self.model.init_latents()
 
     def forward(self, text, return_loss = True):
-        width, num_cutouts = self.image_size, self.num_cutouts
 
-        out = self.model()
+        def get_loss(out):
+            width, num_cutouts = self.image_size, self.num_cutouts
 
-        if not return_loss:
-            return out
+            if not return_loss:
+                return out
 
-        pieces = []
-        for ch in range(num_cutouts):
-            size = int(width * torch.zeros(1,).normal_(mean=.8, std=.3).clip(.5, .95))
-            offsetx = torch.randint(0, width - size, ())
-            offsety = torch.randint(0, width - size, ())
-            apper = out[:, :, offsetx:offsetx + size, offsety:offsety + size]
-            if (self.experimental_resample):
-                apper = resample(apper, (224, 224))
-            else:
-                apper = F.interpolate(apper, (224, 224), **self.interpolation_settings)
-            pieces.append(apper)
+            def get_embed(out):
+                pieces = []
+                for ch in range(num_cutouts):
+                    size = int(width * torch.zeros(1,).normal_(mean=.8, std=.3).clip(.5, .95))
+                    offsetx = torch.randint(0, width - size, ())
+                    offsety = torch.randint(0, width - size, ())
+                    apper = out[:, :, offsetx:offsetx + size, offsety:offsety + size]
+                    if (self.experimental_resample):
+                        apper = resample(apper, (224, 224))
+                    else:
+                        apper = F.interpolate(apper, (224, 224), **self.interpolation_settings)
+                    pieces.append(apper)
 
-        into = torch.cat(pieces)
-        into = normalize_image(into)
+                into = torch.cat(pieces).type(torch.FloatTensor)
+                into = normalize_image(into)
 
-        image_embed = perceptor.encode_image(into)
-        text_embed = perceptor.encode_text(text)
+                return perceptor.encode_image(into)
 
-        latents, soft_one_hot_classes = self.model.latents()
-        num_latents = latents.shape[0]
-        latent_thres = self.model.latents.thresh_lat
+            image_embed = get_embed(out)
+            # target_embed = get_embed(target)
+            text_embed = perceptor.encode_text(text)
 
-        lat_loss =  torch.abs(1 - torch.std(latents, dim=1)).mean() + \
-                    torch.abs(torch.mean(latents)).mean() + \
-                    4 * torch.max(torch.square(latents).mean(), latent_thres)
+            latents, soft_one_hot_classes = self.model.latents()
+            num_latents = latents.shape[0]
+            latent_thres = self.model.latents.thresh_lat
 
-        for array in latents:
-            mean = torch.mean(array)
-            diffs = array - mean
-            var = torch.mean(torch.pow(diffs, 2.0))
-            std = torch.pow(var, 0.5)
-            zscores = diffs / std
-            skews = torch.mean(torch.pow(zscores, 3.0))
-            kurtoses = torch.mean(torch.pow(zscores, 4.0)) - 3.0
+            lat_loss =  torch.abs(1 - torch.std(latents, dim=1)).mean() + \
+                        torch.abs(torch.mean(latents)).mean() + \
+                        4 * torch.max(torch.square(latents).mean(), latent_thres)
 
-        lat_loss = lat_loss + torch.abs(kurtoses) / num_latents + torch.abs(skews) / num_latents
-        cls_loss = ((50 * torch.topk(soft_one_hot_classes, largest = False, dim = 1, k = 999)[0]) ** 2).mean()
+            for array in latents:
+                mean = torch.mean(array)
+                diffs = array - mean
+                var = torch.mean(torch.pow(diffs, 2.0))
+                std = torch.pow(var, 0.5)
+                zscores = diffs / std
+                skews = torch.mean(torch.pow(zscores, 3.0))
+                kurtoses = torch.mean(torch.pow(zscores, 4.0)) - 3.0
 
-        sim_loss = -self.loss_coef * torch.cosine_similarity(text_embed, image_embed, dim = -1).mean()
+            lat_loss = lat_loss + torch.abs(kurtoses) / num_latents + torch.abs(skews) / num_latents
+            cls_loss = ((50 * torch.topk(soft_one_hot_classes, largest = False, dim = 1, k = 999)[0]) ** 2).mean()
+
+            sim_loss = -self.loss_coef * torch.cosine_similarity(text_embed, image_embed, dim = -1).mean()
+            return (lat_loss, cls_loss, sim_loss)
+
+        (lat_loss, cls_loss, sim_loss) = get_loss(self.model())
+        _, _, tar_loss = get_loss(io.read_image(self.target_img)[None, :, :].cuda())
+
+        sim_loss = torch.pow((torch.pow(sim_loss, 2) + torch.pow(tar_loss, 2)), 0.5)
+
         return (lat_loss, cls_loss, sim_loss)
+
+
+
 
 class Imagine(nn.Module):
     def __init__(
@@ -259,6 +277,7 @@ class Imagine(nn.Module):
             max_classes = max_classes,
             class_temperature = class_temperature,
             experimental_resample = experimental_resample,
+            target_img = "target.png"
         ).cuda()
 
         self.model = model
